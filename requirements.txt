@@ -1,0 +1,2 @@
+# ChainPulse API — minimal deps (stdlib-only server)
+# No external dependencies required for the C2 server
